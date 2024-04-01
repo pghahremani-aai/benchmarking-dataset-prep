@@ -59,6 +59,7 @@ def write_filtered_data_to_new_table(client, dataset_id, source_table_id, select
     SELECT *
     FROM `{client.project}.{dataset_id}.{source_table_id}`
     WHERE raw_filepath IN ({formatted_paths})
+    LIMIT 1000
     """
 
     # Define the destination table
@@ -71,46 +72,52 @@ def write_filtered_data_to_new_table(client, dataset_id, source_table_id, select
 
     print(f"Filtered data based on raw file paths written to {destination_dataset_id}.{destination_table_id}")
 
-def filter_data(client, dataset_id, source_table_id, raw_file_path_column, order_by_column, batch_size=10000):
-    # Query to count the total rows in the source table
-    count_query = f"SELECT COUNT(*) as total FROM `{client.project}.{dataset_id}.{source_table_id}`"
-    count_job = client.query(count_query)
-    total_rows = count_job.result().to_dataframe().iloc[0, 0]
-
-    filtered_data = []
-    offset = 0
-
-    while offset < total_rows:
-        # Filtering query with limit and offset for batch processing
+def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=None, order_by_column=None, apply_filter=True, limit=1000):
+    if apply_filter and raw_file_path_column and order_by_column:
         query = f"""
         WITH RankedData AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY {raw_file_path_column} ORDER BY {order_by_column} DESC) as rn
-            FROM `{client.project}.{dataset_id}.{source_table_id}`
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY {raw_file_path_column} ORDER BY {order_by_column} DESC) AS rn
+            FROM `{client.project}.{dataset_id}.{table_id}`
         )
         SELECT *
         FROM RankedData
         WHERE rn = 1
-        LIMIT {batch_size} OFFSET {offset}
+        LIMIT {limit}
         """
         query_job = client.query(query)
-        batch_data = list(query_job.result())
-        
-        filtered_data.extend(batch_data)
-        offset += batch_size
+        filtered_data = list(query_job.result())
+        total_rows = len(filtered_data)
+    else:
+        query = f"SELECT * FROM `{client.project}.{dataset_id}.{table_id}` LIMIT {limit}"
+        query_job = client.query(query)
+        filtered_data = list(query_job.result())
+        total_rows = len(filtered_data)
 
     return filtered_data, total_rows
 
-def compute_data_metrics(transcript):
-    proper_noun_ratio, tag_distribution = compute_proper_nouns_ratio_and_distribution(transcript)
+def compute_data_metrics(transcript, nlp):
+    # Use the nlp model to process the transcript
+    doc = nlp(transcript)
+
+    # Compute the proper nouns ratio and tag distribution
+    proper_nouns = [token.text for token in doc if token.pos_ == 'PROPN']
+    proper_nouns_count = len(proper_nouns)
+    total_words = len(doc)
+    proper_noun_ratio = proper_nouns_count / total_words if total_words > 0 else 0
+
+    tag_distribution = Counter([token.label_ for token in doc.ents])
+
+    # Compute the count of email addresses and phone numbers
     email_count = len(extract_email_addresses(transcript))
     phone_count = len(extract_phone_numbers(transcript))
-    
+
     return {
         'proper_noun_ratio': proper_noun_ratio,
-        'tag_distribution': tag_distribution, 
+        'tag_distribution': tag_distribution,
         'email_count': email_count,
         'phone_count': phone_count
     }
+
 
 def compute_statistics(data):
     """
@@ -197,10 +204,6 @@ def process_timestamps(timestamps, compute_metrics=True):
     
     return timestamp_data
 
-def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column, order_by_column):
-    filtered_data, total_rows = filter_data(client, dataset_id, table_id, raw_file_path_column, order_by_column)
-    return filtered_data, total_rows
-
 def save_results_to_json(selected_data, selected_tag_distribution, json_path):
     if not os.path.exists(json_path):
         os.makedirs(json_path)
@@ -249,30 +252,36 @@ def compute_and_save_statistics(selected_data, json_path, fields_to_include=None
 
     return statistics
 
-def compute_data_metrics_parallel(data, compute_metrics=True, transcript_column='human_transcript_text', timestamp_column='human_transcript_timestamps'):
-    if timestamp_column in data and compute_metrics:
-        timestamp_data = process_timestamps(data[timestamp_column])
-        return [{**segment, **compute_data_metrics(segment[transcript_column])} for segment in timestamp_data]
-    else:
-        return [{**data, **compute_data_metrics(data[transcript_column])}]
+def compute_data_metrics_parallel(data, compute_metrics=True, transcript_column='human_transcript_text'):
+    # Initialize the necessary resources inside the function
+    nlp = spacy.load("en_core_web_sm")  # For example, load the spaCy model here if needed
 
-def process_and_select_data(client, filtered_data, source_dataset_id, source_table_id, 
+    # Proceed with the processing using the locally initialized resources
+    if compute_metrics and transcript_column in data:
+        transcript = data[transcript_column]
+        return compute_data_metrics(transcript, nlp)  # Assuming compute_data_metrics uses nlp
+    else:
+        return data  # or some default processing
+
+def process_and_select_data(filtered_data, source_dataset_id, source_table_id, 
                             destination_dataset_id, destination_table_id, 
                             transcript_column='human_transcript_text', timestamp_column='human_transcript_timestamps',
-                            select_with_timestamp=False, data_selection_hrs=10):
-    """
-    Process the filtered data to compute metrics, select based on proper noun ratio,
-    and then write the selected data to a new BigQuery table.
-    """
+                            select_with_timestamp=False, data_selection_hrs=10,project_id='assemblyai-nlp'):
     logging.info("Starting to process data...")
+    
     with ProcessPoolExecutor() as executor:
         future_to_data = {executor.submit(compute_data_metrics_parallel, data, select_with_timestamp, 
-                                          transcript_column, timestamp_column): data for data in filtered_data}
+                                          transcript_column): data for data in filtered_data}
         
         all_data_with_metrics = []
         for future in as_completed(future_to_data):
             all_data_with_metrics.extend(future.result())
             logging.info(f"Processed {len(all_data_with_metrics)}/{len(filtered_data)} rows.")
+    
+    # After processing, write data to BigQuery in the main process, not in the worker processes
+    client = bigquery.Client(project=project_id)  # Initialize the BigQuery client in the main process
+    write_filtered_data_to_new_table(client, source_dataset_id, source_table_id, all_data_with_metrics, 
+                                     destination_dataset_id, destination_table_id)
 
     logging.info("Data processing completed. Starting sorting and selection...")
     
@@ -301,7 +310,7 @@ def main():
     dataset_id = 'youtube_usm_scraped_dataset'
     table_id = '2024-03-scrape-human-transcripts-metadata-download-join'
     destination_dataset_id = 'youtube_usm_scraped_dataset'
-    destination_table_id = '2024-03-scrape-human-transcripts-selected-data-proper-nouns-full'
+    destination_table_id = '2024-03-scrape-human-transcripts-selected-data-proper-nouns-10hrs'
     select_with_timestamp = False # Set to True if you want to process timestamp segments
     client = bigquery.Client(project=project_id)
 
@@ -312,13 +321,13 @@ def main():
     print(f"Number of processors available: {num_processors}")
 
     # Step 1: Fetch and Filter Data
-    filtered_data, total_rows = fetch_and_filter_data(client, dataset_id, table_id, 'raw_filepath', 'duration')
+    filtered_data, total_rows = fetch_and_filter_data(client, dataset_id, table_id, 'raw_filepath', 'duration', apply_filter=False, limit=17000)
     print(f"Filtered data: {len(filtered_data)} out of {total_rows} rows")
     # Step 2: Process and Select Data
-    selected_data, selected_tag_distribution = process_and_select_data(client, filtered_data, dataset_id, table_id, 
+    selected_data, selected_tag_distribution = process_and_select_data(filtered_data, dataset_id, table_id, 
                                                                        destination_dataset_id, destination_table_id,
                                                                        'human_transcript_text', 'human_transcript_timestamps',
-                                                                       select_with_timestamp)
+                                                                       select_with_timestamp,project_id)
 
     # Step 3: Compute and Save Statistics
     json_path = 'data'

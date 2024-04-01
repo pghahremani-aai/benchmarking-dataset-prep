@@ -9,7 +9,7 @@ import os
     This script extracts and filters data from a BigQuery table based on certain criteria. 
     It also computes various metrics and statistics on the extracted data.
     The filtered data is then written to a new table in BigQuery.
-    
+
     You need to install the following packages:
     pip install google-cloud-bigquery
     pip install spacy
@@ -67,28 +67,26 @@ def write_filtered_data_to_new_table(client, dataset_id, source_table_id, select
 
     print(f"Filtered data based on raw file paths written to {destination_dataset_id}.{destination_table_id}")
 
-def filter_data(client, dataset_id, source_table_id, raw_file_path_column, order_by_column):
-    # Query to count the total rows in the source table
-    count_query = f"SELECT COUNT(*) as total FROM `{client.project}.{dataset_id}.{source_table_id}`"
-    count_job = client.query(count_query)
-    count_result = count_job.result()
-    total_rows = [row['total'] for row in count_result][0]
-
-    # Filtering query
-    query = f"""
-    WITH RankedData AS (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY {raw_file_path_column} ORDER BY {order_by_column} DESC) as rn
-        FROM `{client.project}.{dataset_id}.{source_table_id}`
-    )
-    SELECT *
-    FROM RankedData
-    WHERE rn = 1
-    LIMIT 500
-    """
-    query_job = client.query(query)
-    results = query_job.result()
-
-    filtered_data = [row for row in results]
+def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=None, order_by_column=None, apply_filter=True, limit=100):
+    if apply_filter and raw_file_path_column and order_by_column:
+        query = f"""
+        WITH RankedData AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY {raw_file_path_column} ORDER BY {order_by_column} DESC) AS rn
+            FROM `{client.project}.{dataset_id}.{table_id}`
+        )
+        SELECT *
+        FROM RankedData
+        WHERE rn = 1
+        LIMIT {limit}
+        """
+        query_job = client.query(query)
+        filtered_data = list(query_job.result())
+        total_rows = len(filtered_data)
+    else:
+        query = f"SELECT * FROM `{client.project}.{dataset_id}.{table_id}` LIMIT {limit}"
+        query_job = client.query(query)
+        filtered_data = list(query_job.result())
+        total_rows = len(filtered_data)
 
     return filtered_data, total_rows
 
@@ -189,10 +187,6 @@ def process_timestamps(timestamps, compute_metrics=True):
     
     return timestamp_data
 
-def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column, order_by_column):
-    filtered_data, total_rows = filter_data(client, dataset_id, table_id, raw_file_path_column, order_by_column)
-    return filtered_data, total_rows
-
 def save_results_to_json(selected_data, selected_tag_distribution, json_path):
     if not os.path.exists(json_path):
         os.makedirs(json_path)
@@ -292,12 +286,12 @@ def main():
     dataset_id = 'youtube_usm_scraped_dataset'
     table_id = '2024-03-scrape-human-transcripts-metadata-download-join'
     destination_dataset_id = 'youtube_usm_scraped_dataset'
-    destination_table_id = '2024-03-scrape-human-transcripts-selected-data-proper-nouns-test'
+    destination_table_id = '2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs'
     select_with_timestamp = False # Set to True if you want to process timestamp segments
     client = bigquery.Client(project=project_id)
 
     # Step 1: Fetch and Filter Data
-    filtered_data, total_rows = fetch_and_filter_data(client, dataset_id, table_id, 'raw_filepath', 'duration')
+    filtered_data, total_rows = fetch_and_filter_data(client, dataset_id, table_id, 'raw_filepath', 'duration',apply_filter=False, limit=3000)
     print(f"Filtered data: {len(filtered_data)} out of {total_rows} rows")
     # Step 2: Process and Select Data
     selected_data, selected_tag_distribution = process_and_select_data(client, filtered_data, dataset_id, table_id, 
