@@ -1,9 +1,10 @@
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
 from collections import Counter
+import json, logging
 import numpy as np
 import re
 import spacy
-import json
 import os
 """
     This script extracts and filters data from a BigQuery table based on certain criteria. 
@@ -35,43 +36,81 @@ import os
 # Load the spaCy language model
 nlp = spacy.load("en_core_web_sm")
 
-def write_filtered_data_to_new_table(client, dataset_id, source_table_id, selected_data, destination_dataset_id, destination_table_id):
-    """
-    Write the filtered data based on raw file paths to a new table in BigQuery.
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    :param client: BigQuery client
-    :param dataset_id: Dataset ID where the source table is located
-    :param source_table_id: Table ID of the source table
-    :param selected_data: List of dictionaries containing selected data including raw file paths
-    :param destination_dataset_id: Dataset ID where the destination table is located
-    :param destination_table_id: Table ID of the destination table
-    """
-    # Extract the raw file paths from the selected_data
-    selected_paths = [item['raw_filepath'] for item in selected_data]
+def write_merged_data_to_new_table(client, dataset_id, source_table_id, selected_data, destination_dataset_id, destination_table_id):
+    # Assume selected_data is a list of dictionaries with new metrics
+    # First, upload selected_data to a temporary BigQuery table
+    temp_table_id = f'{destination_dataset_id}.selected_data'
+    job_config = bigquery.LoadJobConfig(write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE, autodetect=True)
+    job = client.load_table_from_json(selected_data, f'{client.project}.{temp_table_id}', job_config=job_config)
+    job.result()  # Wait for the job to complete
 
-    # Use the selected_paths to filter and create the final dataset
-    formatted_paths = ', '.join(f"'{path}'" for path in selected_paths)
-    final_query = f"""
-    SELECT *
-    FROM `{client.project}.{dataset_id}.{source_table_id}`
-    WHERE raw_filepath IN ({formatted_paths})
+    # Now, create the query to merge the temporary table with the original table
+    # You should specify column names explicitly to avoid 'temp_' prefix and control the schema of the final table
+    merge_query = f"""
+    SELECT orig.*, temp.proper_noun_ratio, temp.tag_distribution, temp.email_count, temp.phone_count  -- specify more columns as needed
+    FROM `{client.project}.{dataset_id}.{source_table_id}` AS orig
+    JOIN `{client.project}.{temp_table_id}` AS temp
+    ON orig.raw_filepath = temp.raw_filepath
     """
 
-    # Define the destination table
+    # Define the destination table and job configuration
     destination_table_ref = client.dataset(destination_dataset_id).table(destination_table_id)
     job_config = bigquery.QueryJobConfig(destination=destination_table_ref, write_disposition='WRITE_TRUNCATE')
 
-    # Execute the query and write the results to the destination table
-    query_job = client.query(final_query, job_config=job_config)
+    # Execute the merge query and write the results to the destination table
+    query_job = client.query(merge_query, job_config=job_config)
     query_job.result()  # Wait for the job to complete
 
-    print(f"Filtered data based on raw file paths written to {destination_dataset_id}.{destination_table_id}")
+    # Clean up the temporary table
+    client.delete_table(temp_table_id)
 
-def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=None, order_by_column=None, apply_filter=True, limit=1000):
+    print(f"Merged data written to {destination_dataset_id}.{destination_table_id}")
+
+def write_merged_data_to_new_table(client, dataset_id, source_table_id, selected_data, destination_dataset_id, destination_table_id):
+    # Upload selected_data to a temporary BigQuery table
+    temp_table_id = 'temp_selected_data'
+    temp_table_ref = client.dataset(dataset_id).table(temp_table_id)
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        autodetect=True
+    )
+    job = client.load_table_from_json(selected_data, temp_table_ref, job_config=job_config)
+    job.result()  # Wait for the job to complete
+
+    # Get the schema of the temporary table to build the column list for the SELECT statement
+    temp_table = client.get_table(temp_table_ref)
+    column_names = [field.name for field in temp_table.schema if field.name not in ['raw_filepath', 'human_transcript_text']]
+
+    # Prepare a query to merge the temporary table with the original table
+    # Alias columns from the temporary table to avoid name collisions
+    temp_select_columns = ', '.join([f'temp.{name} AS temp_{name}' for name in column_names])
+    orig_select_columns = 'orig.*'  # or specify columns explicitly if necessary
+    merge_query = f"""
+    CREATE OR REPLACE TABLE `{client.project}.{destination_dataset_id}.{destination_table_id}` AS
+    SELECT {orig_select_columns}, {temp_select_columns}
+    FROM `{client.project}.{dataset_id}.{source_table_id}` AS orig
+    JOIN `{client.project}.{dataset_id}.{temp_table_id}` AS temp
+    ON orig.raw_filepath = temp.raw_filepath
+    """
+    query_job = client.query(merge_query)
+    query_job.result()  # Wait for the job to complete
+
+    # Clean up: delete the temporary table
+    client.delete_table(temp_table_ref)
+
+    print(f"Merged data written to {destination_dataset_id}.{destination_table_id}")
+
+def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=None, order_by_column=None, apply_filter=True, limit=1000, select_columns=None):
+    if select_columns is None:
+        select_columns = '*'  # Fetch all columns if none are specified
+
     if apply_filter and raw_file_path_column and order_by_column:
         query = f"""
         WITH RankedData AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY {raw_file_path_column} ORDER BY {order_by_column} DESC) AS rn
+            SELECT {select_columns}, ROW_NUMBER() OVER (PARTITION BY {raw_file_path_column} ORDER BY {order_by_column} DESC) AS rn
             FROM `{client.project}.{dataset_id}.{table_id}`
         )
         SELECT *
@@ -80,7 +119,7 @@ def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=Non
         LIMIT {limit}
         """
     else:
-        query = f"SELECT * FROM `{client.project}.{dataset_id}.{table_id}` LIMIT {limit}"
+        query = f"SELECT {select_columns} FROM `{client.project}.{dataset_id}.{table_id}` LIMIT {limit}"
 
     query_job = client.query(query)
     
@@ -92,17 +131,29 @@ def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=Non
     total_rows = len(filtered_data)
     return filtered_data, total_rows
 
-def compute_data_metrics(transcript):
-    proper_noun_ratio, tag_distribution = compute_proper_nouns_ratio_and_distribution(transcript)
+def compute_data_metrics(transcript, nlp):
+    # Use the nlp model to process the transcript
+    doc = nlp(transcript)
+
+    # Compute the proper nouns ratio and tag distribution
+    proper_nouns = [token.text for token in doc if token.pos_ == 'PROPN']
+    proper_nouns_count = len(proper_nouns)
+    total_words = len(doc)
+    proper_noun_ratio = proper_nouns_count / total_words if total_words > 0 else 0
+
+    tag_distribution = Counter([token.label_ for token in doc.ents])
+
+    # Compute the count of email addresses and phone numbers
     email_count = len(extract_email_addresses(transcript))
     phone_count = len(extract_phone_numbers(transcript))
-    
+
     return {
         'proper_noun_ratio': proper_noun_ratio,
-        'tag_distribution': tag_distribution, 
+        'tag_distribution': tag_distribution,
         'email_count': email_count,
         'phone_count': phone_count
     }
+
 
 def compute_statistics(data):
     """
@@ -237,51 +288,89 @@ def compute_and_save_statistics(selected_data, json_path, fields_to_include=None
 
     return statistics
 
-def process_and_select_data(client, filtered_data, source_dataset_id, source_table_id, destination_dataset_id, destination_table_id, 
-                            transcript_column='human_transcript_text', timestamp_column='human_transcript_timestamps', select_with_timestamp=False, data_selection_hrs=10):
-    """
-    Process the filtered data to compute metrics, select based on proper noun ratio,
-    and then write the selected data to a new BigQuery table.
+def compute_data_metrics_parallel(data, compute_metrics=True, transcript_column='human_transcript_text'):
+    # Initialize the necessary resources inside the function
+    nlp = spacy.load("en_core_web_sm")  # For example, load the spaCy model here if needed
 
-    :param client: BigQuery client instance.
-    :param filtered_data: Data that has been filtered for processing.
-    :param source_dataset_id: ID of the source dataset.
-    :param source_table_id: ID of the source table.
-    :param destination_dataset_id: ID of the destination dataset.
-    :param destination_table_id: ID of the destination table.
-    :param select_with_timestamp: Boolean flag to process data with timestamps.
-    :return: A tuple of selected data and the tag distribution.
-    """
-    # Compute metrics for each row or segment
+    # Proceed with the processing using the locally initialized resources
+    if compute_metrics and transcript_column in data:
+        transcript = data[transcript_column]
+        return compute_data_metrics(transcript, nlp)  # Assuming compute_data_metrics uses nlp
+    else:
+        return data  # or some default processing
+
+def process_and_select_data(filtered_data, client, source_dataset_id, source_table_id, 
+                            destination_dataset_id, destination_table_id, 
+                            transcript_column='human_transcript_text', 
+                            timestamp_column='human_transcript_timestamps',
+                            select_with_timestamp=False, data_selection_hrs=10, batch_size=1000):
+    logging.info("Starting to process data...")
+
+    total_processed = 0
     all_data_with_metrics = []
-    for data in filtered_data:
-        if select_with_timestamp and timestamp_column in data:
-            timestamp_data = process_timestamps(data[timestamp_column])
-            for segment in timestamp_data:
-                metrics = compute_data_metrics(segment['transcript_segment'])
-                all_data_with_metrics.append({**segment, **metrics})
-        else:
-            metrics = compute_data_metrics(data[transcript_column])
-            all_data_with_metrics.append({**data, **metrics})
+    
+    # Process data in batches
+    for i in range(0, len(filtered_data), batch_size):
+        batch = filtered_data[i:i + batch_size]
+        batch_data_with_metrics = []
 
-    # Sort data by proper noun ratio in descending order
+        for data in batch:
+            if select_with_timestamp and timestamp_column in data:
+                timestamp_data = process_timestamps(data[timestamp_column])
+                for segment in timestamp_data:
+                    metrics = compute_data_metrics(segment['transcript_segment'], nlp)
+                    batch_data_with_metrics.append({**segment, **metrics})
+            else:
+                metrics = compute_data_metrics(data[transcript_column], nlp)
+                batch_data_with_metrics.append({**data, **metrics})
+        
+        all_data_with_metrics.extend(batch_data_with_metrics)
+        total_processed += len(batch)
+        logging.info(f"Processed {total_processed}/{len(filtered_data)} rows.")
+
+    logging.info("Data processing completed. Starting sorting and selection...")
+    
+    
     sorted_data = sorted(all_data_with_metrics, key=lambda x: x['proper_noun_ratio'], reverse=True)
 
-    # Select data up to the specified total duration (e.g., 10 hours)
     total_duration = 0
     selected_data = []
     selected_tag_distribution = Counter()
     for data in sorted_data:
         total_duration += data.get('duration', 0)
-        if total_duration > data_selection_hrs * 3600:  # Convert hours to seconds
+        if total_duration > data_selection_hrs * 3600:
             break
         selected_data.append(data)
         selected_tag_distribution += data['tag_distribution']
 
-    # Write the selected data to the new BigQuery table
-    write_filtered_data_to_new_table(client, source_dataset_id, source_table_id, selected_data, destination_dataset_id, destination_table_id)
+    logging.info("Data selection completed. Starting to write data to the new BigQuery table...")
 
     return selected_data, selected_tag_distribution
+
+def merge_with_original_data(client, dataset_id, table_id, selected_data, key_column):
+    # Fetch original data based on keys in selected_data
+    keys = [item[key_column] for item in selected_data]
+    formatted_keys = ', '.join(f"'{key}'" for key in keys)
+    query = f"""
+    SELECT *
+    FROM `{client.project}.{dataset_id}.{table_id}`
+    WHERE {key_column} IN ({formatted_keys})
+    """
+    query_job = client.query(query)
+    original_data = list(query_job.result())
+
+    # Convert to dictionary for easy lookup
+    original_data_dict = {row[key_column]: dict(row) for row in original_data}
+
+    # Merge original data with selected_data
+    merged_data = []
+    for item in selected_data:
+        key = item[key_column]
+        original_row = original_data_dict.get(key, {})
+        merged_row = {**original_row, **item}  # Original data merged with selected data
+        merged_data.append(merged_row)
+
+    return merged_data
 
 def main():
     project_id = 'assemblyai-nlp'
@@ -289,21 +378,35 @@ def main():
     # This table filtered out duplicate raw file paths and ordered by duration in BigQuery. 
     # So we no longer need to apply the filter in the fetch_and_filter_data function and can set apply_filter=False.
     table_id = '2024-03-scrape-human-transcripts-selected-data-join-distinct' 
+    limit = 1000 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
+    batch_size = 500
     destination_dataset_id = 'youtube_usm_scraped_dataset'
-    destination_table_id = '2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs'
+    destination_table_id = f'2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs-limit-{limit}-v2'
     select_with_timestamp = False # Set to True if you want to process timestamp segments
     client = bigquery.Client(project=project_id)
 
+    # Get the number of processors available
+    num_processors = os.cpu_count()
+
+    # Print the number of processors
+    print(f"Number of processors available: {num_processors}")
+
     # Step 1: Fetch and Filter Data
-    filtered_data, total_rows = fetch_and_filter_data(client, dataset_id, table_id, 'raw_filepath', 'duration',apply_filter=False, limit=500)
+    select_columns = 'raw_filepath, duration, human_transcript_text, human_transcript_timestamps'  # Specify the columns you need
+    filtered_data, total_rows = fetch_and_filter_data(client, dataset_id, table_id, 'raw_filepath', 'duration', apply_filter=False, limit=limit, select_columns=select_columns)
     print(f"Filtered data: {len(filtered_data)} out of {total_rows} rows")
     # Step 2: Process and Select Data
-    selected_data, selected_tag_distribution = process_and_select_data(client, filtered_data, dataset_id, table_id, 
+    selected_data, selected_tag_distribution = process_and_select_data(filtered_data, client, dataset_id, table_id, 
                                                                        destination_dataset_id, destination_table_id,
                                                                        'human_transcript_text', 'human_transcript_timestamps',
-                                                                       select_with_timestamp)
+                                                                       select_with_timestamp, 10, batch_size)
 
-    # Step 3: Compute and Save Statistics
+    
+    # Step 3: Write Data to New Table
+    # Merge selected_data with original fields and write to a new table
+    write_merged_data_to_new_table(client, dataset_id, table_id, selected_data, destination_dataset_id, destination_table_id)
+
+    # Step 4: Compute and Save Statistics
     json_path = 'data'
     # Define the fields you want to include in your JSON file
     fields_to_include = ['raw_filepath', 'proper_noun_ratio', 'duration', 'tag_distribution']
