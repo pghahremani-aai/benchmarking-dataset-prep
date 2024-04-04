@@ -1,4 +1,3 @@
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from google.cloud import bigquery
 from collections import Counter
 import json, logging
@@ -6,6 +5,8 @@ import numpy as np
 import re
 import spacy
 import os
+from transformers import pipeline
+import re
 """
     This script extracts and filters data from a BigQuery table based on certain criteria. 
     It also computes various metrics and statistics on the extracted data.
@@ -33,8 +34,12 @@ import os
     or 
     source myenv/bin/activate    
 """
-# Load the spaCy language model
-nlp = spacy.load("en_core_web_sm")
+# Function to initialize the NLP model
+def get_nlp_model(use_transformer=False):
+    if use_transformer:
+        return pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english", framework="pt")
+    else:
+        return spacy.load("en_core_web_sm")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -131,19 +136,32 @@ def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=Non
     total_rows = len(filtered_data)
     return filtered_data, total_rows
 
-def compute_data_metrics(transcript, nlp):
-    # Use the nlp model to process the transcript
-    doc = nlp(transcript)
+# Compute data metrics function that adapts based on the NLP model used
+import re
 
-    # Compute the proper nouns ratio and tag distribution
-    proper_nouns = [token.text for token in doc if token.pos_ == 'PROPN']
+def compute_data_metrics(transcript, nlp, use_transformer=False):
+    if use_transformer:
+        results = nlp(transcript)
+        # Extract proper nouns with the entity filter applied
+        proper_nouns = [result['word'] for result in results 
+                        if result['entity'] in ['B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC']
+                        and len(result['word']) > 1
+                        and re.match(r'^[A-Za-z]+$', result['word'])
+                        and re.match(r'^[A-Z][a-z]+$', result['word'])]
+    else:
+        doc = nlp(transcript)
+        proper_nouns = [ent.text for ent in doc.ents 
+                        if ent.label_ in ['PERSON', 'ORG', 'GPE']
+                        and len(ent.text) > 1
+                        and re.match(r'^[A-Za-z]+$', ent.text)
+                        and re.match(r'^[A-Z][a-z]+$', ent.text)]
+
+    tag_distribution = Counter([ent.label_ for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE']])
+
     proper_nouns_count = len(proper_nouns)
-    total_words = len(doc)
+    total_words = len(transcript.split())
     proper_noun_ratio = proper_nouns_count / total_words if total_words > 0 else 0
 
-    tag_distribution = Counter([token.label_ for token in doc.ents])
-
-    # Compute the count of email addresses and phone numbers
     email_count = len(extract_email_addresses(transcript))
     phone_count = len(extract_phone_numbers(transcript))
 
@@ -153,7 +171,6 @@ def compute_data_metrics(transcript, nlp):
         'email_count': email_count,
         'phone_count': phone_count
     }
-
 
 def compute_statistics(data):
     """
@@ -299,11 +316,10 @@ def compute_data_metrics_parallel(data, compute_metrics=True, transcript_column=
     else:
         return data  # or some default processing
 
-def process_and_select_data(filtered_data, client, source_dataset_id, source_table_id, 
-                            destination_dataset_id, destination_table_id, 
+def process_and_select_data(filtered_data, client, dataset_id, table_id, destination_dataset_id, destination_table_id,
                             transcript_column='human_transcript_text', 
                             timestamp_column='human_transcript_timestamps',
-                            select_with_timestamp=False, data_selection_hrs=10, batch_size=1000):
+                            select_with_timestamp=False, data_selection_hrs=10, batch_size=1000, nlp=None, use_transformer=False):
     logging.info("Starting to process data...")
 
     total_processed = 0
@@ -318,10 +334,10 @@ def process_and_select_data(filtered_data, client, source_dataset_id, source_tab
             if select_with_timestamp and timestamp_column in data:
                 timestamp_data = process_timestamps(data[timestamp_column])
                 for segment in timestamp_data:
-                    metrics = compute_data_metrics(segment['transcript_segment'], nlp)
+                    metrics = compute_data_metrics(segment['transcript_segment'], nlp, use_transformer=use_transformer)
                     batch_data_with_metrics.append({**segment, **metrics})
             else:
-                metrics = compute_data_metrics(data[transcript_column], nlp)
+                metrics = compute_data_metrics(data[transcript_column], nlp, use_transformer=use_transformer)
                 batch_data_with_metrics.append({**data, **metrics})
         
         all_data_with_metrics.extend(batch_data_with_metrics)
@@ -372,16 +388,17 @@ def merge_with_original_data(client, dataset_id, table_id, selected_data, key_co
 
     return merged_data
 
-def main():
+def main(use_transformer=True):
+    nlp = get_nlp_model(use_transformer=use_transformer)
     project_id = 'assemblyai-nlp'
     dataset_id = 'youtube_usm_scraped_dataset'
     # This table filtered out duplicate raw file paths and ordered by duration in BigQuery. 
     # So we no longer need to apply the filter in the fetch_and_filter_data function and can set apply_filter=False.
     table_id = '2024-03-scrape-human-transcripts-selected-data-join-distinct' 
-    limit = 1000 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
-    batch_size = 500
+    limit = 100 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
+    batch_size = 50
     destination_dataset_id = 'youtube_usm_scraped_dataset'
-    destination_table_id = f'2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs-limit-{limit}-v2'
+    destination_table_id = f'2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs-limit-{limit}-use-transformer-{use_transformer}'
     select_with_timestamp = False # Set to True if you want to process timestamp segments
     client = bigquery.Client(project=project_id)
 
@@ -399,7 +416,7 @@ def main():
     selected_data, selected_tag_distribution = process_and_select_data(filtered_data, client, dataset_id, table_id, 
                                                                        destination_dataset_id, destination_table_id,
                                                                        'human_transcript_text', 'human_transcript_timestamps',
-                                                                       select_with_timestamp, 10, batch_size)
+                                                                       select_with_timestamp, 10, batch_size, nlp=nlp, use_transformer=use_transformer)
 
     
     # Step 3: Write Data to New Table
@@ -420,5 +437,5 @@ def main():
 
 if __name__ == "__main__":
     print("Starting process...")
-    main()
+    main(use_transformer=False)
     print("Process completed.")
