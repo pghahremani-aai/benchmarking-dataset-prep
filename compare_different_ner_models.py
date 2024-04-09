@@ -1,25 +1,19 @@
 """"
-This script is designed for evaluating Named Entity Recognition (NER) models, 
-particularly focusing on a comparative analysis between a baseline model and a newly proposed model. 
-It employs the WNUT2017 dataset to provide a consistent evaluation framework, 
-ensuring that both models are assessed under the same conditions.
+This script is designed for evaluating Named Entity Recognition (NER) models using the WNUT2017 dataset, 
+aiming to provide a thorough comparative analysis across different models. It ensures that all models are 
+evaluated under consistent conditions, allowing for an equitable comparison.
 
-The script operates by generating NER predictions from each model, 
-followed by a meticulous process of aligning and mapping these predictions to 
-the standardized tagging scheme of the dataset. This is crucial for addressing the variances 
-in tokenization between the models' outputs and the actual data annotations, with a special 
-focus on correctly handling subtokens and other tokenization nuances.
+The evaluation process involves generating NER predictions from each model and then aligning and 
+mapping these predictions to the dataset's standardized tagging scheme. 
+This step is crucial for accurately handling the discrepancies in tokenization between 
+the model outputs and the actual dataset annotations, with particular attention given 
+to subtokens and other tokenization nuances.
 
-A significant feature of this evaluation is the manual mapping of model-specific entity tags 
-to those in the dataset, facilitating an apples-to-apples comparison in the subsequent analysis. 
-The core of the evaluation lies in computing key metrics such as precision, recall, and the F1 score for both models, 
-alongside generating a comprehensive classification report that offers a detailed breakdown of each model's 
-performance across different entity types.
-
-This methodical approach allows for an in-depth comparative study, illuminating 
-the strengths and potential areas for improvement in the NER capabilities of each model. 
-Through this script, users can gain valuable insights into the relative performance of the models, 
-guiding future developments and refinements in NER model implementations.
+An important aspect of the script is the manual mapping of model-specific entity tags to 
+those in the dataset, which aids in making a direct comparison between the models. 
+The script computes key metrics such as precision, recall, and the F1 score, 
+and it produces a comprehensive classification report that details each model's 
+performance across various entity types.
 """
 
 from transformers import pipeline, AutoModelForTokenClassification, AutoTokenizer
