@@ -37,7 +37,7 @@ import re
 # Function to initialize the NLP model
 def get_nlp_model(use_transformer=False):
     if use_transformer:
-        return pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english", framework="pt")
+        return pipeline("ner", model="tner/roberta-large-wnut2017", framework="pt")
     else:
         return spacy.load("en_core_web_sm")
 
@@ -389,14 +389,15 @@ def merge_with_original_data(client, dataset_id, table_id, selected_data, key_co
     return merged_data
 
 def main(use_transformer=True):
+    print("Starting process with transformer..." if use_transformer else "Starting process with SpaCy model...")
     nlp = get_nlp_model(use_transformer=use_transformer)
     project_id = 'assemblyai-nlp'
     dataset_id = 'youtube_usm_scraped_dataset'
     # This table filtered out duplicate raw file paths and ordered by duration in BigQuery. 
     # So we no longer need to apply the filter in the fetch_and_filter_data function and can set apply_filter=False.
     table_id = '2024-03-scrape-human-transcripts-selected-data-join-distinct' 
-    limit = 100 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
-    batch_size = 50
+    limit = 2000 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
+    batch_size = 500
     destination_dataset_id = 'youtube_usm_scraped_dataset'
     destination_table_id = f'2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs-limit-{limit}-use-transformer-{use_transformer}'
     select_with_timestamp = False # Set to True if you want to process timestamp segments
