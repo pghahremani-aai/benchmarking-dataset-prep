@@ -1,6 +1,7 @@
 from google.cloud import bigquery
 from collections import Counter
 import json, logging
+from transformers import pipeline, AutoModelForTokenClassification, AutoTokenizer
 import numpy as np
 import re
 import spacy
@@ -140,23 +141,36 @@ def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=Non
 import re
 
 def compute_data_metrics(transcript, nlp, use_transformer=False):
+    proper_nouns = []
+
     if use_transformer:
         results = nlp(transcript)
-        # Extract proper nouns with the entity filter applied
-        proper_nouns = [result['word'] for result in results 
-                        if result['entity'] in ['B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC']
-                        and len(result['word']) > 1
-                        and re.match(r'^[A-Za-z]+$', result['word'])
-                        and re.match(r'^[A-Z][a-z]+$', result['word'])]
-    else:
-        doc = nlp(transcript)
-        proper_nouns = [ent.text for ent in doc.ents 
-                        if ent.label_ in ['PERSON', 'ORG', 'GPE']
-                        and len(ent.text) > 1
-                        and re.match(r'^[A-Za-z]+$', ent.text)
-                        and re.match(r'^[A-Z][a-z]+$', ent.text)]
 
-    tag_distribution = Counter([ent.label_ for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE']])
+        # Assuming the keys in model_ner_tags are integers and need to map them to strings
+        model_ner_tags = nlp.model.config.id2label  # This should give a dict like {0: 'B-PER', 1: 'I-PER', ...}
+
+        relevant_tags = {'B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC'}
+        relevant_entity_groups = {key for key, value in model_ner_tags.items() if value in relevant_tags}
+        
+        proper_nouns = [
+            result['word'] for result in results
+            if model_ner_tags.get(result['entity']) in relevant_tags
+            and len(result['word']) > 1
+            and re.match(r'^[A-Z][a-z]+$', result['word'])
+        ]
+
+        tag_distribution = Counter([model_ner_tags.get(result['entity'], 'O') for result in results])
+    else:
+        # SpaCy processing
+        doc = nlp(transcript)
+        proper_nouns = [
+            ent.text for ent in doc.ents
+            if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']
+            and len(ent.text) > 1
+            and re.match(r'^[A-Z][a-z]+$', ent.text)
+        ]
+
+        tag_distribution = Counter([ent.label_ for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']])
 
     proper_nouns_count = len(proper_nouns)
     total_words = len(transcript.split())
@@ -438,5 +452,5 @@ def main(use_transformer=True):
 
 if __name__ == "__main__":
     print("Starting process...")
-    main(use_transformer=False)
+    main(use_transformer=True)
     print("Process completed.")
