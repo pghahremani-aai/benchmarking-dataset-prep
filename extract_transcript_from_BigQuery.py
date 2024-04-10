@@ -138,28 +138,66 @@ def fetch_and_filter_data(client, dataset_id, table_id, raw_file_path_column=Non
     return filtered_data, total_rows
 
 # Compute data metrics function that adapts based on the NLP model used
-import re
+import re, torch
 
-def compute_data_metrics(transcript, nlp, use_transformer=False):
+def compute_data_metrics(transcript, nlp, use_transformer=False, batch_size=512, context_window_size=10):
     proper_nouns = []
 
     if use_transformer:
-        results = nlp(transcript)
-
-        # Assuming the keys in model_ner_tags are integers and need to map them to strings
-        model_ner_tags = nlp.model.config.id2label  # This should give a dict like {0: 'B-PER', 1: 'I-PER', ...}
-
-        relevant_tags = {'B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC'}
-        relevant_entity_groups = {key for key, value in model_ner_tags.items() if value in relevant_tags}
+        tag_distribution = Counter()
+        tokens = transcript.split()
+        model_name = nlp.model.config.name_or_path
+        tokenizer = AutoTokenizer.from_pretrained(model_name, add_prefix_space=True)
+        model = AutoModelForTokenClassification.from_pretrained(model_name)
         
-        proper_nouns = [
-            result['word'] for result in results
-            if model_ner_tags.get(result['entity']) in relevant_tags
-            and len(result['word']) > 1
-            and re.match(r'^[A-Z][a-z]+$', result['word'])
-        ]
+        # Initialize variables to store context from previous batch
+        previous_context = []
+        word_level_predictions = []
 
-        tag_distribution = Counter([model_ner_tags.get(result['entity'], 'O') for result in results])
+        # Extract words and proper nouns based on relevant tags
+        relevant_tags = {'B-person', 'I-person', 'B-corporation', 'I-corporation', 'B-location', 'I-location', 'B-group', 'I-group'}
+
+        for i in range(0, len(tokens), batch_size):
+            batch = tokens[i:i+batch_size]
+            
+            # Concatenate previous context with current batch
+            batch_with_context = previous_context + batch
+            
+            encoded_input = tokenizer(batch_with_context, is_split_into_words=True, return_tensors="pt", padding=True, truncation=True)
+
+            with torch.no_grad():
+                output = model(**encoded_input)
+
+            predictions = output.logits.argmax(-1).squeeze().tolist()
+            word_ids = encoded_input.word_ids()
+
+            # Initialize an empty list to hold the predictions for each original word in the batch
+            batch_predictions = ['O'] * len(batch_with_context)  # Assuming 'O' is the default label
+            for idx, word_id in enumerate(word_ids):
+                if word_id is not None and (idx == 0 or word_id != word_ids[idx - 1]):
+                    # Assign the label of the first subtoken to the entire word
+                    batch_predictions[word_id] = model.config.id2label[predictions[idx]]
+
+            # Separate predictions for current batch from previous context
+            batch_predictions = batch_predictions[len(previous_context):]
+            word_level_predictions.extend(batch_predictions)
+
+            # Update previous context for next batch
+            previous_context = batch[-context_window_size:]  # Adjust context window as needed
+
+        assert len(tokens) == len(word_level_predictions), "Length mismatch between tokens and predictions"
+        tag_distribution.update(tag for tag in word_level_predictions if tag in relevant_tags)
+
+        proper_nouns = []
+        for token, tag in zip(tokens, word_level_predictions):
+            if tag in relevant_tags:
+                proper_nouns.append(token)
+        
+        # Calculate tag distribution for proper nouns
+        # Extract tags and count their occurrences
+        proper_nouns_count = len(proper_nouns)
+        total_words = len(tokens)
+        proper_noun_ratio = proper_nouns_count / total_words if total_words > 0 else 0
     else:
         # SpaCy processing
         doc = nlp(transcript)
@@ -172,13 +210,13 @@ def compute_data_metrics(transcript, nlp, use_transformer=False):
 
         tag_distribution = Counter([ent.label_ for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']])
 
-    proper_nouns_count = len(proper_nouns)
-    total_words = len(transcript.split())
-    proper_noun_ratio = proper_nouns_count / total_words if total_words > 0 else 0
+        proper_nouns_count = len(proper_nouns)
+        total_words = len(transcript.split())
+        proper_noun_ratio = proper_nouns_count / total_words if total_words > 0 else 0
 
     email_count = len(extract_email_addresses(transcript))
     phone_count = len(extract_phone_numbers(transcript))
-
+    
     return {
         'proper_noun_ratio': proper_noun_ratio,
         'tag_distribution': tag_distribution,
@@ -230,7 +268,7 @@ def extract_high_proper_noun_sections_with_timestamps(transcripts_with_timestamp
     
     return high_proper_noun_sections
 
-def compute_proper_nouns_ratio_and_distribution(transcript):
+def compute_proper_nouns_ratio_and_distribution(transcript, nlp, use_transformer=False):
     """
     Compute the ratio of proper nouns in a given transcript and the distribution of proper noun tags.
     
@@ -243,12 +281,22 @@ def compute_proper_nouns_ratio_and_distribution(transcript):
     """
     if not transcript:
         return 0, Counter()
-
-    doc = nlp(transcript)
-    proper_nouns = [ent.text for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']]
-    proper_nouns_count = len(proper_nouns)
-    total_words = len(doc)
-    ratio = proper_nouns_count / total_words if total_words > 0 else 0
+    
+    if use_transformer:
+        # `nlp` is the pipeline loaded with the 'ner' task
+        results = nlp(transcript)
+        proper_nouns = [result['word'] for result in results if result['entity'] in ['B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC']]
+        proper_nouns_count = len(proper_nouns)
+        total_words = len(transcript.split())
+        ratio = proper_nouns_count / total_words if total_words > 0 else 0
+        tag_distribution = Counter([result['entity'] for result in results if result['entity'] in ['B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC']])
+    else:
+        # `nlp` is the SpaCy model loaded with `en_core_web_sm`
+        doc = nlp(transcript)
+        proper_nouns = [ent.text for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']]
+        proper_nouns_count = len(proper_nouns)
+        total_words = len(doc)
+        ratio = proper_nouns_count / total_words if total_words > 0 else 0
 
     tag_distribution = Counter([ent.label_ for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC']])
     
@@ -318,17 +366,6 @@ def compute_and_save_statistics(selected_data, json_path, fields_to_include=None
     print(f"Selected data and statistics have been saved to {json_path}")
 
     return statistics
-
-def compute_data_metrics_parallel(data, compute_metrics=True, transcript_column='human_transcript_text'):
-    # Initialize the necessary resources inside the function
-    nlp = spacy.load("en_core_web_sm")  # For example, load the spaCy model here if needed
-
-    # Proceed with the processing using the locally initialized resources
-    if compute_metrics and transcript_column in data:
-        transcript = data[transcript_column]
-        return compute_data_metrics(transcript, nlp)  # Assuming compute_data_metrics uses nlp
-    else:
-        return data  # or some default processing
 
 def process_and_select_data(filtered_data, client, dataset_id, table_id, destination_dataset_id, destination_table_id,
                             transcript_column='human_transcript_text', 
@@ -410,8 +447,8 @@ def main(use_transformer=True):
     # This table filtered out duplicate raw file paths and ordered by duration in BigQuery. 
     # So we no longer need to apply the filter in the fetch_and_filter_data function and can set apply_filter=False.
     table_id = '2024-03-scrape-human-transcripts-selected-data-join-distinct' 
-    limit = 2000 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
-    batch_size = 500
+    limit = 100 # If None, it will fetch all rows from the table. Otherwise, it will fetch the specified number of rows.
+    batch_size = 50
     destination_dataset_id = 'youtube_usm_scraped_dataset'
     destination_table_id = f'2024-03-scrape-human-transcripts-selected-data-proper-nouns-ratio-10hrs-limit-{limit}-use-transformer-{use_transformer}'
     select_with_timestamp = False # Set to True if you want to process timestamp segments
