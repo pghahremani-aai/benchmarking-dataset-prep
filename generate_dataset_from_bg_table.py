@@ -35,6 +35,14 @@ import csv
 import os
 import datetime
 
+def check_table_exists(table_id):
+    bq_client = bigquery.Client()
+    try:
+        bq_client.get_table(table_id)
+        return True  # Table exists
+    except Exception as e:
+        return False  # Table does not exist or an error occurred
+
 def copy_file_in_gcs(source_path, destination_path, destination_bucket_name, source_bucket_name=None):
     storage_client = storage.Client()
 
@@ -63,44 +71,53 @@ def upload_to_gcs(local_path, destination_path, bucket_name):
     blob = storage_client.bucket(bucket_name).blob(destination_path)
     blob.upload_from_filename(local_path)
 
-def create_filtered_table(source_table_id, filtered_table_name, project_id):
+def create_filtered_table(source_table_id, filtered_table_name, project_id, category_field, delete_existing=False):
     bq_client = bigquery.Client()
-    filter_query = f"""
-    WITH SortedFiltered AS (
-    SELECT 
-        *,
-        SUM(duration) OVER (ORDER BY categories.proper_nouns.density DESC) AS running_total
-    FROM 
-        `{source_table_id}`
-    WHERE 
-        duration BETWEEN 120 AND 1200 
-        AND NOT human_transcript_text LIKE '%[Content_Types].xml%'
-        AND NOT REGEXP_CONTAINS(human_transcript_text, r'\\b[A-Z]{2,}\\b')  -- Exclude words in all caps
-        AND NOT REGEXP_CONTAINS(human_transcript_text, r'(\\b[A-Z]{2,}\\s+){2,}')  -- Exclude segments with multiple consecutive all-caps words
-        AND REGEXP_CONTAINS(human_transcript_text, r'([.!?]\\s+[A-Z])|([.!?]$)')  -- Check for proper sentence structure
-        AND NOT REGEXP_CONTAINS(human_transcript_text, r'♪')  -- Exclude lines with musical notes, likely from machine transcription of music
-    ),
-    LimitedByTime AS (
+
+    # Check if the destination table already exists
+    destination_table_id = f"{project_id}.{source_table_id.split('.')[1]}.{filtered_table_name}"
+    if delete_existing and check_table_exists(destination_table_id):
+        print(f"Table {destination_table_id} already exists. Deleting and recreating...")
+        bq_client.delete_table(destination_table_id)  # Delete the existing table
+
+        filter_query = f"""
+        WITH SortedFiltered AS (
+        SELECT 
+            *,
+            SUM(duration) OVER (ORDER BY categories.{category_field}.density DESC) AS running_total
+        FROM 
+            `{source_table_id}`
+        WHERE 
+            duration BETWEEN 120 AND 1200 
+            AND NOT human_transcript_text LIKE '%[Content_Types].xml%'
+            AND NOT REGEXP_CONTAINS(human_transcript_text, r'\\b[A-Z]{2,}\\b')  -- Exclude words in all caps
+            AND NOT REGEXP_CONTAINS(human_transcript_text, r'(\\b[A-Z]{2,}\\s+){2,}')  -- Exclude segments with multiple consecutive all-caps words
+            AND REGEXP_CONTAINS(human_transcript_text, r'([.!?]\\s+[A-Z])|([.!?]$)')  -- Check for proper sentence structure
+            AND NOT REGEXP_CONTAINS(human_transcript_text, r'♪')  -- Exclude lines with musical notes, likely from machine transcription of music
+        ),
+        LimitedByTime AS (
+            SELECT 
+                *
+            FROM 
+                SortedFiltered
+            WHERE 
+                running_total <= 36000
+        )
         SELECT 
             *
         FROM 
-            SortedFiltered
-        WHERE 
-            running_total <= 36000
-    )
-    SELECT 
-        *
-    FROM 
-        LimitedByTime
-    ORDER BY 
-        categories.proper_nouns.density DESC
-    """
+            LimitedByTime
+        WHERE
+            categories.{category_field}.count > 2  -- Example condition for count threshold
+        ORDER BY 
+            categories.{category_field}.density DESC
+        """
 
-    # Construct the full table name with the timestamp
-    destination_table_id = f"{project_id}.{source_table_id.split('.')[1]}.{filtered_table_name}"
-    job_config = bigquery.QueryJobConfig(destination=destination_table_id)
-    job = bq_client.query(filter_query, job_config=job_config)
-    job.result()
+        # Run the filter query and create the destination table
+        job_config = bigquery.QueryJobConfig(destination=destination_table_id)
+        job = bq_client.query(filter_query, job_config=job_config)
+        job.result()  # Wait for the job to complete
+    
     return destination_table_id
 
 def generate_tsv_from_table(query, local_output_file, destination_folder, dataset_name, bucket_name):
@@ -119,29 +136,35 @@ def generate_tsv_from_table(query, local_output_file, destination_folder, datase
             copy_file_in_gcs(source_blob_path, destination_blob_path, bucket_name)
             writer.writerow([index, destination_blob_path, row.human_transcript_text, dataset_name])
 
-def log_statistics(table_id, log_file="statistics.log"):
+def compute_statistics(table_id, category_field, log_file="statistics.log"):
     bq_client = bigquery.Client()
+
+    # Define the statistics query with the dynamic category field name
     stats_query = f"""
-    SELECT
-      AVG(categories.proper_nouns.density) AS mean_proper_nouns_density,
-      VAR_SAMP(categories.proper_nouns.density) AS variance_proper_nouns_density,
-      STDDEV_SAMP(categories.proper_nouns.density) AS stddev_proper_nouns_density,
-      APPROX_QUANTILES(categories.proper_nouns.density, 100)[OFFSET(50)] AS P50_proper_nouns_density,
-      APPROX_QUANTILES(categories.proper_nouns.density, 100)[OFFSET(90)] AS P90_proper_nouns_density,
-      APPROX_QUANTILES(categories.proper_nouns.density, 100)[OFFSET(99)] AS P99_proper_nouns_density,
-      AVG(duration) AS mean_duration,
-      VAR_SAMP(duration) AS variance_duration,
-      STDDEV_SAMP(duration) AS stddev_duration,
-      APPROX_QUANTILES(duration, 100)[OFFSET(50)] AS P50_duration,
-      APPROX_QUANTILES(duration, 100)[OFFSET(90)] AS P90_duration,
-      APPROX_QUANTILES(duration, 100)[OFFSET(99)] AS P99_duration
-    FROM
-      `{table_id}`
+        SELECT
+            SUM(categories.{category_field}.count) AS total_{category_field}_count,
+            AVG(categories.{category_field}.count) AS mean_{category_field}_count,
+            AVG(categories.{category_field}.density) AS mean_{category_field}_density,
+            VAR_SAMP(categories.{category_field}.density) AS variance_{category_field}_density,
+            STDDEV_SAMP(categories.{category_field}.density) AS stddev_{category_field}_density,
+            APPROX_QUANTILES(categories.{category_field}.density, 100)[OFFSET(50)] AS P50_{category_field}_density,
+            APPROX_QUANTILES(categories.{category_field}.density, 100)[OFFSET(90)] AS P90_{category_field}_density,
+            APPROX_QUANTILES(categories.{category_field}.density, 100)[OFFSET(99)] AS P99_{category_field}_density,
+            SUM(duration) AS total_duration,
+            AVG(duration) AS mean_duration,
+            VAR_SAMP(duration) AS variance_duration,
+            STDDEV_SAMP(duration) AS stddev_duration,
+            APPROX_QUANTILES(duration, 100)[OFFSET(50)] AS P50_duration,
+            APPROX_QUANTILES(duration, 100)[OFFSET(90)] AS P90_duration,
+            APPROX_QUANTILES(duration, 100)[OFFSET(99)] AS P99_duration
+        FROM
+            `{table_id}`
     """
 
-    result = bq_client.query(stats_query).result()
+    # Execute the stats query
+    result_stats = bq_client.query(stats_query).result()
     with open(log_file, "w") as file:
-        for row in result:
+        for row in result_stats:
             for key, value in row.items():
                 # Check if the value is a float and format it
                 if isinstance(value, float):
@@ -149,31 +172,74 @@ def log_statistics(table_id, log_file="statistics.log"):
                 else:
                     file.write(f"{key}: {value}\n")
 
-def main():
-    dataset_name = "proper_nouns_2024_10hrs_youtube_usm_scraped_dataset"
+def aggregate_evidence(table_id, category_field, log_file="aggregated_evidence.log"):
+    bq_client = bigquery.Client()
+
+    # Define the aggregate evidence query
+    aggregate_query = f"""
+        WITH FlattenedEvidence AS (
+            SELECT
+                id,
+                evidence
+            FROM
+                `{table_id}`,
+                UNNEST(categories.{category_field}.evidence) AS evidence
+        )
+        SELECT
+            id,
+            ARRAY_AGG(evidence) AS aggregated_evidence
+        FROM
+            FlattenedEvidence
+        GROUP BY
+            id
+    """
+
+    # Execute the aggregate query
+    result_aggregate = bq_client.query(aggregate_query).result()
+    with open(log_file, "w") as file:
+        for row in result_aggregate:
+            for key, value in row.items():
+                # Check if the value is a float and format it
+                if isinstance(value, float):
+                    file.write(f"{key}: {value:.3f}\n")
+                else:
+                    file.write(f"{key}: {value}\n")
+
+def main(category):
+    # List of supported categories
+    supported_categories = ['proper_nouns', 'emails', 'addresses', 'alphanumerics', 'phone_numbers', 'websites']
+
+    # Check if the provided category is supported
+    if category not in supported_categories:
+        raise ValueError(f"Unsupported category '{category}'. Please choose from: {', '.join(supported_categories)}")
+
+    # Define the dataset name based on the category
+    dataset_name = f"{category}_2024_10hrs_youtube_usm_scraped_dataset"
+
+    # Other parameters
     source_table_id = "assemblyai-nlp.youtube_usm_scraped_dataset.2024-03-scrape-human-transcripts-distinct-w-new-categories-full"
-    filtered_table_name = "filtered_proper_nouns_10hrs_youtube_usm_scraped_dataset"
+    filtered_table_name = f"filtered_{category}_10hrs_youtube_usm_scraped_dataset"
     bucket_name = "aai-us-central1"
     destination_folder = f"datasets/asr_analysis/datasets/{dataset_name}"
     
     # Log file for dataset statistics
     local_path = os.path.dirname(os.path.abspath(__file__))
-    local_dataset_dir = f"{local_path}/datasets/proper_nouns"
+    local_dataset_dir = f"{local_path}/datasets/{category}"
     if not os.path.exists(local_dataset_dir):
         os.makedirs(local_dataset_dir)
-    dataset_log_file = f"{local_dataset_dir}/{dataset_name}_statistics.log"
+    local_stats_log_file = f"{local_dataset_dir}/{dataset_name}_statistics.log"
     local_output_file = f"{local_dataset_dir}/{dataset_name}.tsv"
 
-    gcs_output_path = f"datasets/asr_analysis/english_test_benchmarks/{dataset_name}_v2.tsv"
+    gcs_output_path = f"datasets/asr_analysis/english_test_benchmarks/{dataset_name}.tsv"
     project_id = 'assemblyai-nlp' # Replace with your project ID
 
     # Create a new filtered table
     # Generate the current timestamp
-    add_timestamp = True # Set to False if you don't want to add a timestamp to the table name
+    add_timestamp = False # Set to False if you don't want to add a timestamp to the table name
     if add_timestamp:
         timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
         filtered_table_name = f"{filtered_table_name}_{timestamp}"
-    filtered_table_id = create_filtered_table(source_table_id, filtered_table_name, project_id)
+    filtered_table_id = create_filtered_table(source_table_id, filtered_table_name, project_id, category, delete_existing=True)
 
     # Generate TSV file from the filtered table and copy files to GCS
     print(f"Generating TSV file from the filtered table: {filtered_table_id}")
@@ -182,7 +248,9 @@ def main():
 
     # Log statistics of the filtered table
     print(f"Logging statistics for the filtered table: {filtered_table_id}")
-    log_statistics(filtered_table_id, log_file=dataset_log_file)
+    compute_statistics(filtered_table_id, category_field=category, log_file=local_stats_log_file)
+    if category != 'proper_nouns':
+        aggregate_evidence(filtered_table_id, category_field=category, log_file=f"{local_dataset_dir}/{dataset_name}_aggregated_evidence.log")
 
     # Upload the generated TSV file to GCS and clean up the local file
     print(f"Uploading the TSV file to GCS: {gcs_output_path}")
@@ -190,4 +258,7 @@ def main():
     os.remove(local_output_file)
 
 if __name__ == "__main__":
-    main()
+    #for category in ['proper_nouns', 'emails', 'addresses', 'alphanumerics', 'phone_numbers', 'websites']:
+    for category in ['emails','phone_numbers']:
+        print(f"Processing category: {category}")
+        main(category)  # Process each category

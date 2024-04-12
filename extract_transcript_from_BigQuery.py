@@ -35,6 +35,38 @@ import re
     or 
     source myenv/bin/activate    
 """
+
+def detect_and_analyze_phone_numbers(transcription):
+    # Load pre-trained NER model
+    ner_model = pipeline("ner", model="tner/roberta-large-wnut2017")
+
+    # Split the transcription into paragraphs or segments
+    segments = transcription.split("\n\n")
+    
+    phone_numbers_with_context = []
+
+    # Iterate through each segment
+    for segment in segments:
+        # Perform named entity recognition on the segment
+        entities = ner_model(segment)
+
+        # Extract phone numbers from the entities
+        phone_numbers = [entity['word'] for entity in entities if entity['entity'] == 'PHONE']
+
+        # Analyze context for the segment
+        context = None
+        if re.search(r'\bphone\b', segment.lower()):
+            context = "Phone-related context"
+        elif re.search(r'\bmy\s+(phone\s+)?number\b', segment.lower()):
+            context = "Request for own phone number"
+        elif re.search(r'\bmy\s+number\b', segment.lower()):
+            context = "Request for own number"
+
+        # Append detected phone numbers and corresponding context to the list
+        phone_numbers_with_context.extend([(number, context) for number in phone_numbers])
+
+    return phone_numbers_with_context
+
 # Function to initialize the NLP model
 def get_nlp_model(use_transformer=False):
     if use_transformer:
@@ -216,7 +248,7 @@ def compute_data_metrics(transcript, nlp, use_transformer=False, batch_size=512,
 
     email_count = len(extract_email_addresses(transcript))
     phone_count = len(extract_phone_numbers(transcript))
-    
+
     return {
         'proper_noun_ratio': proper_noun_ratio,
         'tag_distribution': tag_distribution,
