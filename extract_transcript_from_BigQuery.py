@@ -8,6 +8,8 @@ import spacy
 import os
 from transformers import pipeline
 import re
+import phonenumbers
+
 """
     This script extracts and filters data from a BigQuery table based on certain criteria. 
     It also computes various metrics and statistics on the extracted data.
@@ -36,10 +38,19 @@ import re
     source myenv/bin/activate    
 """
 
-def detect_and_analyze_phone_numbers(transcription):
-    # Load pre-trained NER model
-    ner_model = pipeline("ner", model="tner/roberta-large-wnut2017")
+def detect_phone_numbers(text):
+    phone_numbers = []
 
+    # Iterate through all phone number matches in the text
+    import pdb; pdb.set_trace()
+    for match in phonenumbers.PhoneNumberMatcher(text, "US"):
+        # Extract the raw phone number string
+        raw_number = phonenumbers.format_number(match.number, phonenumbers.PhoneNumberFormat.E164)
+        phone_numbers.append(raw_number)
+
+    return phone_numbers
+
+def detect_and_analyze_phone_numbers(transcription):
     # Split the transcription into paragraphs or segments
     segments = transcription.split("\n\n")
     
@@ -47,11 +58,8 @@ def detect_and_analyze_phone_numbers(transcription):
 
     # Iterate through each segment
     for segment in segments:
-        # Perform named entity recognition on the segment
-        entities = ner_model(segment)
-
-        # Extract phone numbers from the entities
-        phone_numbers = [entity['word'] for entity in entities if entity['entity'] == 'PHONE']
+        # Detect phone numbers in the segment using regex and phonenumbers library
+        detected_numbers = detect_phone_numbers(segment)
 
         # Analyze context for the segment
         context = None
@@ -63,7 +71,7 @@ def detect_and_analyze_phone_numbers(transcription):
             context = "Request for own number"
 
         # Append detected phone numbers and corresponding context to the list
-        phone_numbers_with_context.extend([(number, context) for number in phone_numbers])
+        phone_numbers_with_context.extend([(number, context) for number in detected_numbers])
 
     return phone_numbers_with_context
 
@@ -521,5 +529,8 @@ def main(use_transformer=True):
 
 if __name__ == "__main__":
     print("Starting process...")
-    main(use_transformer=True)
+    #main(use_transformer=True)
     print("Process completed.")
+    text = "My phone number is 123-456-7890. Please call me at 987-654-3210."
+    phone_numbers = detect_phone_numbers(text)
+    print(phone_numbers)
